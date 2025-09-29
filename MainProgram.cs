@@ -15,7 +15,7 @@ using Unity.Services.Core;
 using Object = UnityEngine.Object;
 
 /// <summary>
-/// TenkiChatController
+/// MainProgram
 /// - Sends user text to OpenAI Chat Completions with a strict JSON schema
 /// - Determines intent: "weather" or "chitchat"
 /// - If "weather": resolves a WeatherAPI.com query and fetches weather (current or forecast)
@@ -85,7 +85,7 @@ public class MainProgram : MonoBehaviour
     public UnityEvent onInteractableEnable;
     public UnityEvent onInteractableDisable;
 
-    public static TenkiChatController instance;
+    public static MainProgram instance;
     
     private string previousUserText = "";
     public bool isAskingWeather = false;
@@ -389,7 +389,7 @@ public class MainProgram : MonoBehaviour
         }
     }
     
-    // ADD inside TenkiChatController
+    // ADD inside MainProgram
     public void StartChatFromExternal(string text)
     {
         if (string.IsNullOrWhiteSpace(text)) return;
@@ -1184,4 +1184,5 @@ public class MainProgram : MonoBehaviour
         OnSendClicked();
     }
 }
+
 
