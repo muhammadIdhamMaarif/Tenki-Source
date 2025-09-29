@@ -14,7 +14,7 @@ using UnityEngine.Networking;
 using UnityEngine.UI;
 using CompressionLevel = System.IO.Compression.CompressionLevel;
 
-public class BatchWeatherProcessor : MonoBehaviour
+public class MultithreadingManager : MonoBehaviour
 {
     public TenkiChatController tenkiChatController;
     
@@ -674,3 +674,4 @@ public class BatchWeatherProcessor : MonoBehaviour
         public string localtime;
     }
 }
+
