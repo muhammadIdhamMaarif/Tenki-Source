@@ -16,7 +16,7 @@ using CompressionLevel = System.IO.Compression.CompressionLevel;
 
 public class MultithreadingManager : MonoBehaviour
 {
-    public TenkiChatController tenkiChatController;
+    public MainProgram tenkiChatController;
     
     [Header("Assign in Inspector")]
     public ButtonManager btnPick;
@@ -674,4 +674,5 @@ public class MultithreadingManager : MonoBehaviour
         public string localtime;
     }
 }
+
 
