@@ -22,7 +22,7 @@ using Object = UnityEngine.Object;
 /// - Displays a friendly Tenki-Chan reply
 /// - Designed for Unity 6000.x and WebGL compatibility
 /// </summary>
-public class TenkiChatController : MonoBehaviour
+public class MainProgram : MonoBehaviour
 {
     [Header("UI (assign in Inspector)")]
     public TMP_InputField InputField;
@@ -1184,3 +1184,4 @@ public class TenkiChatController : MonoBehaviour
         OnSendClicked();
     }
 }
+
