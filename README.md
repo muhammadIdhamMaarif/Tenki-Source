@@ -11,6 +11,10 @@
 
 ---
 
+## MAIN REPOSITORY (**[Tenki Weather](https://github.com/muhammadIdhamMaarif/Tenki-Weather)**)
+
+---
+
 ## TL;DR
 
 * **`MultithreadingManager`** membangun *worker pool* berbasis **coroutine** untuk menjalankan **ratusan permintaan jaringan secara konkuren** (I/O-bound). Alokasi pekerjaan aman via `Interlocked.Increment` → *lock-free*.
