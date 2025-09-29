@@ -1,3 +1,107 @@
+/*
+==========================================================
+ MultithreadingManager.cs — Panduan Cepat & Dokumentasi
+==========================================================
+
+🔎 Gambaran Besar
+-----------------
+Script ini ngerjain pipeline "Input lokasi → Fetch cuaca (paralel) → Export hasil".
+Targetnya perform buat WebGL (bisa ratusan/barisan lokasi), tapi juga jalan di Editor/Standalone.
+
+Alur besarnya:
+1) User upload CSV/XLSX (kolom minimal: Name, Lat, Lon)
+2) Klik "Process" → script bikin worker pool (coroutines) sesuai `maxConcurrency`
+3) Tiap row di-hit ke WeatherAPI (atau via relay) + retry/backoff buat error transient
+4) Hasil diisi ke _rows → bisa diunduh sebagai CSV/XLSX
+
+🧩 Komponen Utama
+-----------------
+- UI Button (Pick/Process/Download CSV/XLSX) + `statusText` untuk progress/status
+- Bridge WebGL:
+  - `FileBridge_PickFile` (JS → C#) untuk pick file dari browser
+  - `FileBridge_DownloadText` untuk nyimpen hasil ke file (WebGL pakai Blob)
+- Parser:
+  - CSV: splitter sederhana yang aman terhadap kutip ganda
+  - XLSX minimal: baca `xl/sharedStrings.xml` + `xl/worksheets/sheet1.xml`
+  - Penulisan XLSX minimal: bikin ZIP dengan part wajib (workbook, sheet1, sharedStrings, props)
+- Networking:
+  - Langsung ke WeatherAPI, atau via `relayBaseUrl` kalau `useRelay = true`
+  - Retry `maxRetries` dgn backoff + jitter untuk 429/5xx/timeout, dll.
+- Concurrency:
+  - Worker pool coroutine (Indeks job diambil atomik via `Interlocked.Increment`)
+  - `maxConcurrency` cocoknya 32–64 untuk WebGL (tuning sesuai limit API)
+
+🗂 Struktur Data
+----------------
+- `KecamatanRow`: input (Name, Lat, Lon) + output (LastUpdate, SuhuC, Kelembapan, dll.)
+- `_rows`: list semua baris
+- `_sourceFilename` dan `_sourceKind`: info asal file untuk penamaan output
+
+🧪 Cara Pakai (Quick Start)
+---------------------------
+1) Assign semua referensi UI di Inspector (btnPick, btnProcess, btnDownloadCsv/Xlsx, statusText)
+2) Set `weatherApiBaseUrl` (default udah ok), pasang API key di `tenkiChatController.WeatherApiKey`
+3) (Opsional) Jika mau relay, set `useRelay = true` dan isi `relayBaseUrl`
+4) Build WebGL → user bisa upload file di browser.
+   Di Editor: kalau lupa upload, drop `StreamingAssets/input.csv` lalu klik Process.
+
+🧭 Format Input
+---------------
+- CSV/XLSX harus punya header yang cocok dengan pola:
+  - nameHeader: "nama|name|kecamatan"
+  - latHeader : "lat|latitude|lintang"
+  - lonHeader : "lon|lng|longitude|bujur"
+  Kamu boleh ubah reglernya di Inspector biar fleksibel (Ind/Eng).
+
+📤 Output
+---------
+- CSV header: Name,Latitude,Longitude,Last Update,Suhu (°C),Kelembapan (%),Kondisi,Kecepatan Angin (kph),Arah Angin,Sinar UV
+- XLSX: single-sheet, minimal parts (cukup buat Excel/Numbers/LibreOffice)
+
+⚙️ Tuning & Best Practices
+--------------------------
+- `maxConcurrency`: naikin perlahan. Ingat batas rate-limit API cuaca.
+- `maxRetries`: 2–4 udah umum. Di-up kalau jaringan kamu kurang stabil.
+- `verbose = true` buat debug (parse error / give-up log).
+- Gunakan relay kalau: 
+  - butuh sembunyiin API key di front-end (WebGL), atau 
+  - mau agregasi/limit request di server.
+
+🛡️ Error Handling
+------------------
+- Missing key → statusText ngasih tahu
+- File gagal parse → statusText + Debug.LogException
+- Networking gagal → retry otomatis utk 429/5xx/timeout; kalau mentok → give up per-row (aman, pipeline lanjut)
+
+🧠 Catatan Implementasi
+-----------------------
+- CSV splitter handle kutip ganda: "a, ""b""" → a, "b"
+- XLSX reader pakai regex (cukup untuk sheet sederhana; kalau sheet kompleks, pakai lib dedicated)
+- XLSX writer: nulis angka sebagai <v>number</v> kalau parse-able; selainnya ke sharedStrings
+- WebGL download XLSX: kirim "binary-as-Latin1" string supaya byte tetap utuh di Blob
+
+🧰 Ekstensi yang gampang ditambah
+---------------------------------
+- Tambah kolom input lain (mis. id, province) → simpan di `KecamatanRow`
+- Tambah sheet lain di XLSX writer
+- Ganti sumber API cuaca (asalkan JSON-nya di-map ke struct `Current`)
+
+📌 FAQ Mini
+-----------
+Q: Kenapa pakai coroutine worker pool, bukan Task/Thread?
+A: Unity WebGL nggak support thread native. Coroutine + UnityWebRequest paling aman lintas target.
+
+Q: Kenapa XLSX-nya "minimal"?
+A: Biar dependency nol dan cocok di WebGL. Kalau butuh fitur kaya (formatting/style), pakai lib eksternal di platform yang mendukung.
+
+Diagram Alur (sederhana)
+------------------------
+[Pick/Editor Fallback] → [Parse CSV/XLSX → _rows] → (Process) → 
+→ [N Workers] → (Fetch Weather per row + Retry) → [_rows terisi] → [Download CSV/XLSX]
+
+==========================================================
+*/
+
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -14,45 +118,74 @@ using UnityEngine.Networking;
 using UnityEngine.UI;
 using CompressionLevel = System.IO.Compression.CompressionLevel;
 
+/// <summary>
+/// Manager untuk:
+/// - Baca CSV/XLSX berisi minimal kolom Name/Lat/Lon
+/// - Ambil data cuaca (WeatherAPI) per baris secara paralel (coroutine worker pool)
+/// - Export hasil ke CSV atau XLSX minimal (tanpa styling)
+///
+/// Desain agar nyaman dipakai di WebGL (file picker & download via JS bridge).
+/// </summary>
 public class MultithreadingManager : MonoBehaviour
 {
+    /// <summary>
+    /// Referensi ke <see cref="MainProgram"/> yang menyimpan WeatherApiKey.
+    /// Pastikan key terisi kalau tidak memakai relay.
+    /// </summary>
     public MainProgram tenkiChatController;
     
     [Header("Assign in Inspector")]
+    /// <summary>Tombol untuk memilih file input (CSV/XLSX) via file picker (WebGL).</summary>
     public ButtonManager btnPick;
+    /// <summary>Tombol untuk mulai proses fetch cuaca.</summary>
     public ButtonManager btnProcess;
+    /// <summary>Tombol untuk download hasil dalam format CSV.</summary>
     public ButtonManager btnDownloadCsv;
+    /// <summary>Tombol untuk download hasil dalam format XLSX minimal.</summary>
     public ButtonManager btnDownloadXlsx;
+    /// <summary>Teks status/progress untuk pengguna.</summary>
     public TMP_Text statusText;
 
     [Header("Networking")]
+    /// <summary>Base URL untuk WeatherAPI (default sudah benar).</summary>
     public string weatherApiBaseUrl = "https://api.weatherapi.com/v1";
+    /// <summary>Jika true, request tidak langsung ke WeatherAPI tapi lewat relay server.</summary>
     public bool useRelay = false;
+    /// <summary>Base URL relay (contoh: https://your-worker.example.com). Hanya dipakai jika <see cref="useRelay"/> = true.</summary>
     public string relayBaseUrl = ""; // e.g., https://your-worker.example.com
 
     [Header("Performance")]
     [Tooltip("How many concurrent requests; start with 32..64 for WebGL")]
+    /// <summary>Jumlah worker paralel. Sesuaikan agar tidak kena rate limit (32–64 lazim).</summary>
     public int maxConcurrency = 48;
     [Tooltip("Max retries per row for transient errors")]
+    /// <summary>Retry maksimum per baris untuk error transient (429/5xx/timeout).</summary>
     public int maxRetries = 3;
 
     [Header("CSV/XLSX Mapping")]
     [Tooltip("Column headers to detect in input (case-insensitive). You can change Indonesian/English names here.")]
+    /// <summary>Pola header untuk kolom nama (regex OR). Bebas ganti sesuai input kamu.</summary>
     public string nameHeader = "nama|name|kecamatan";
+    /// <summary>Pola header untuk kolom latitude.</summary>
     public string latHeader  = "lat|latitude|lintang";
+    /// <summary>Pola header untuk kolom longitude.</summary>
     public string lonHeader  = "lon|lng|longitude|bujur";
 
     [Header("Debug")]
+    /// <summary>Kalau true, tulis log tambahan (parse error/give-up per row).</summary>
     public bool verbose = false;
 
 #if UNITY_WEBGL && !UNITY_EDITOR
+    // Bridge ke JavaScript (hanya aktif di WebGL build, bukan Editor)
     [System.Runtime.InteropServices.DllImport("__Internal")]
     private static extern void FileBridge_PickFile(string accept, string gameObjectName, string callbackMethod);
 
     [System.Runtime.InteropServices.DllImport("__Internal")]
     private static extern void FileBridge_DownloadText(string filename, string mime, string data);
 #else
-    // Editor/Standalone fallbacks
+    // Editor/Standalone fallback: 
+    // - PickFile: kasih warning (pakai StreamingAssets/input.csv kalau lupa upload)
+    // - DownloadText: tulis file ke disk (parent folder dari Assets)
     private static void FileBridge_PickFile(string accept, string gameObjectName, string callbackMethod)
     {
         Debug.LogWarning("Use WebGL build to test browser file picker. In Editor: drag CSV into /StreamingAssets/input.csv and press Process.");
@@ -66,14 +199,19 @@ public class MultithreadingManager : MonoBehaviour
 #endif
 
     // ===== Data model =====
+
+    /// <summary>
+    /// Satu baris data (input + output cuaca).
+    /// </summary>
     [Serializable]
     public class KecamatanRow
     {
+        // Input
         public string Name;
         public double Lat;
         public double Lon;
 
-        // outputs
+        // Output dari WeatherAPI
         public string LastUpdate;
         public double SuhuC;
         public int Kelembapan;
@@ -83,11 +221,16 @@ public class MultithreadingManager : MonoBehaviour
         public double UV;
     }
 
-    // Internal
+    // Internal buffer semua row yang sedang/akan diproses.
     private readonly List<KecamatanRow> _rows = new();
+    // Nama file sumber (tanpa ekstensi) → dipakai untuk nama output.
     private string _sourceFilename = "input";
+    // Jenis sumber (csv/xlsx) — hanya informasi.
     private string _sourceKind = "csv"; // csv/xlsx
 
+    /// <summary>
+    /// Awake: pasang event listener tombol & set status awal.
+    /// </summary>
     void Awake()
     {
         if (btnPick)         btnPick.onClick.AddListener(OnPick);
@@ -99,17 +242,27 @@ public class MultithreadingManager : MonoBehaviour
     }
 
     // ===== UI actions =====
+
+    /// <summary>
+    /// Handler tombol "Pick" → panggil file picker (WebGL).
+    /// Editor/Standalone: cuma warning (gunakan StreamingAssets sebagai fallback).
+    /// </summary>
     void OnPick()
     {
         Debug.Log("File Clicked");
         FileBridge_PickFile(".csv,.xlsx", gameObject.name, nameof(OnWebFilePicked));
     }
 
-    // Called from JS: payload = "name.ext|ext|<base64>"
+    /// <summary>
+    /// Callback dari JS saat file dipilih.
+    /// Format payload: "name.ext|ext|&lt;base64&gt;"
+    /// </summary>
+    /// <param name="payload">String gabungan nama|ekstensi|base64</param>
     public void OnWebFilePicked(string payload)
     {
         try
         {
+            // Pisahkan "name.ext|ext|<base64>"
             var firstPipe = payload.IndexOf('|');
             var secondPipe = payload.IndexOf('|', firstPipe + 1);
             var filename = payload.Substring(0, firstPipe);
@@ -119,6 +272,7 @@ public class MultithreadingManager : MonoBehaviour
             _sourceFilename = Path.GetFileNameWithoutExtension(filename);
             _sourceKind = (ext == "xlsx") ? "xlsx" : "csv";
 
+            // Decode isi file
             var bytes = Convert.FromBase64String(b64);
             if (_sourceKind == "csv")
             {
@@ -139,6 +293,12 @@ public class MultithreadingManager : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// Handler tombol "Process".
+    /// - Validasi API key (kecuali pakai relay)
+    /// - Fallback Editor: cari /StreamingAssets/input.csv jika belum ada _rows
+    /// - Mulai coroutine worker pool
+    /// </summary>
     void OnProcess()
     {
         if (string.IsNullOrWhiteSpace(tenkiChatController.WeatherApiKey) && !useRelay)
@@ -166,6 +326,11 @@ public class MultithreadingManager : MonoBehaviour
         StartCoroutine(ProcessAll());
     }
 
+    /// <summary>
+    /// Download hasil sebagai CSV atau XLSX.
+    /// WebGL: lewat JS bridge. Editor: disimpan di parent folder Assets.
+    /// </summary>
+    /// <param name="kind">"csv" atau "xlsx"</param>
     void Download(string kind)
     {
         if (_rows.Count == 0)
@@ -186,13 +351,7 @@ public class MultithreadingManager : MonoBehaviour
             {
                 var xlsxBytes = BuildXlsx();
                 var b64 = Convert.ToBase64String(xlsxBytes);
-                // For WebGL, easiest is data URL via the same function
-                // Our bridge expects plain text; so provide base64 and a small JS sniff?
-                // Simpler: write as octet-stream text decoded in JS—so add a tiny MIME wrapper:
-                // We'll just use the same function; browsers still save the bytes correctly if we pass a binary string.
-                // Safer approach: convert base64->binary within JS. To keep this self-contained, we use CSV for huge cases
-                // and this xlsx for normal size—works well.
-                // Here we just call DownloadText with atob data reconstructed as Latin1:
+                // WebGL: paling aman kirim sebagai "binary-as-Latin1" supaya Blob nerima byte asli.
                 var binary = Base64ToLatin1(b64);
                 FileBridge_DownloadText($"{_sourceFilename}_weather.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", binary);
                 statusText.text = "XLSX downloaded.";
@@ -205,7 +364,9 @@ public class MultithreadingManager : MonoBehaviour
         }
     }
 
-    // Convert base64 to a ISO-8859-1 string so JS Blob gets exact bytes
+    /// <summary>
+    /// Utility: ubah base64 → string Latin1 (tiap byte jadi 1 char 0..255) agar JS Blob dapet byte persis.
+    /// </summary>
     string Base64ToLatin1(string b64)
     {
         var bytes = Convert.FromBase64String(b64);
@@ -215,6 +376,13 @@ public class MultithreadingManager : MonoBehaviour
     }
 
     // ===== CSV =====
+
+    /// <summary>
+    /// Parse CSV ke dalam <see cref="_rows"/>.
+    /// - Baris pertama dianggap header
+    /// - Deteksi kolom pakai regex dari nameHeader/latHeader/lonHeader
+    /// - Split baris aman untuk tanda kutip ganda
+    /// </summary>
     void ParseCsv(string csv)
     {
         _rows.Clear();
@@ -246,6 +414,12 @@ public class MultithreadingManager : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// Split satu baris CSV. Support:
+    /// - Koma sebagai delimiter
+    /// - Tanda kutip ganda untuk mengapit field yang mengandung koma/kutip/newline
+    /// - Escape kutip ganda di dalam quoted field: "" → "
+    /// </summary>
     IEnumerable<string> SplitCsvLine(string line)
     {
         // simple CSV splitter (handles quotes)
@@ -257,16 +431,21 @@ public class MultithreadingManager : MonoBehaviour
             if (c == '\"')
             {
                 if (inQuotes && i+1<line.Length && line[i+1]=='\"')
-                { sb.Append('\"'); i++; }
-                else inQuotes = !inQuotes;
+                { sb.Append('\"'); i++; }         // "" → tambahkan satu " ke hasil
+                else inQuotes = !inQuotes;        // toggle quoted mode
             }
             else if (c == ',' && !inQuotes)
-            { yield return sb.ToString(); sb.Length = 0; }
+            { yield return sb.ToString(); sb.Length = 0; } // delimiter di luar quotes
             else sb.Append(c);
         }
         yield return sb.ToString();
     }
 
+    /// <summary>
+    /// Cari index header yang cocok dgn pola regex:
+    /// - Coba exact match dulu (^(?:pattern)$)
+    /// - Kalau gagal, fallback ke "contains" (Regex.IsMatch tanpa anchor)
+    /// </summary>
     int FindIndex(string[] headers, string pattern)
     {
         var rx = new Regex($"^(?:{pattern})$", RegexOptions.IgnoreCase);
@@ -283,6 +462,11 @@ public class MultithreadingManager : MonoBehaviour
         return -1;
     }
 
+    /// <summary>
+    /// Parse double yang toleran:
+    /// - Ganti koma → titik (mendukung format Eropa)
+    /// - Gunakan CultureInfo.InvariantCulture
+    /// </summary>
     double ParseDouble(string s)
     {
         s = s.Trim().Replace(",", "."); // robust for European CSVs
@@ -290,6 +474,10 @@ public class MultithreadingManager : MonoBehaviour
         return 0;
     }
 
+    /// <summary>
+    /// Susun CSV output lengkap (dengan escape kalau ada koma/kutip/newline).
+    /// Urutan kolom sesuai spesifikasi.
+    /// </summary>
     string BuildCsv()
     {
         // header: Name,Lat,Lon, then the 7 outputs
@@ -321,6 +509,14 @@ public class MultithreadingManager : MonoBehaviour
 
     // ===== Minimal XLSX (first sheet only; strings/numbers) =====
     // Read: sharedStrings + sheet1. Write: a simple single-sheet workbook.
+
+    /// <summary>
+    /// Parse XLSX minimal:
+    /// - Baca sharedStrings (kalau ada) untuk mapping index → string
+    /// - Ambil sheet pertama (sheet1.xml atau sheetX.xml)
+    /// - Extract cell (A1, B2, dst), handle tipe "s" (shared string) vs angka
+    /// - Baris pertama dianggap header → deteksi kolom Name/Lat/Lon
+    /// </summary>
     void ParseXlsx(byte[] bytes)
     {
         _rows.Clear();
@@ -339,7 +535,7 @@ public class MultithreadingManager : MonoBehaviour
                 sharedStrings.Add(System.Net.WebUtility.HtmlDecode(m.Groups[1].Value));
         }
 
-        // sheet1
+        // sheet1 (atau sheetX pertama yang ditemukan)
         var sheetEntry = zip.GetEntry("xl/worksheets/sheet1.xml") ?? zip.Entries.FirstOrDefault(e=>e.FullName.StartsWith("xl/worksheets/sheet", StringComparison.OrdinalIgnoreCase));
         if (sheetEntry == null) throw new Exception("No worksheet found in XLSX.");
 
@@ -362,7 +558,7 @@ public class MultithreadingManager : MonoBehaviour
 
                 int colIndex = ColLettersToIndex(colLetters); // 0-based
                 string cellText = val;
-                if (t == "s") // shared string
+                if (t == "s") // shared string → map index ke teks
                 {
                     if (int.TryParse(val, out var sidx) && sidx >= 0 && sidx < sharedStrings.Count)
                         cellText = sharedStrings[sidx];
@@ -370,6 +566,7 @@ public class MultithreadingManager : MonoBehaviour
                 }
                 cells[colIndex] = cellText;
             }
+            // Bikin list kolom berukuran maxCol+1 biar index aman
             var maxCol = cells.Count == 0 ? 0 : cells.Keys.Max();
             var row = new List<string>(Enumerable.Repeat("", maxCol+1));
             foreach (var kv in cells) row[kv.Key] = kv.Value;
@@ -385,6 +582,7 @@ public class MultithreadingManager : MonoBehaviour
         if (idxName < 0 || idxLat < 0 || idxLon < 0)
             throw new Exception("XLSX sheet1 must contain columns: Name, Lat, Lon (see nameHeader/latHeader/lonHeader patterns).");
 
+        // Isi _rows mulai baris ke-2 (index 1)
         for (int r=1; r<rows.Count; r++)
         {
             var cols = rows[r];
@@ -397,6 +595,9 @@ public class MultithreadingManager : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// Convert huruf kolom (A, B, ..., Z, AA, AB, ...) menjadi index 0-based.
+    /// </summary>
     int ColLettersToIndex(string letters)
     {
         int n=0;
@@ -404,6 +605,11 @@ public class MultithreadingManager : MonoBehaviour
         return n-1;
     }
 
+    /// <summary>
+    /// Build file XLSX minimal (1 sheet, no styles) dari konten <see cref="_rows"/>.
+    /// - Teks tertentu dipaksa jadi sharedStrings
+    /// - Angka valid ditulis sebagai numeric value (bukan string)
+    /// </summary>
     byte[] BuildXlsx()
     {
         // Build a super-simple XLSX with one sheet and no styles
@@ -449,12 +655,14 @@ public class MultithreadingManager : MonoBehaviour
             {
                 string a1 = ToA1(c) + (r+1).ToString();
                 var v = cols[c] ?? "";
-                if (r==0 || (c==0 || c==3 || c==6 || c==8)) // force text on some columns
+                // Kolom teks: header baris 0, juga kolom 0(Name),3(LastUpdate),6(Kondisi),8(ArahAngin)
+                if (r==0 || (c==0 || c==3 || c==6 || c==8))
                 {
                     sheetSb.Append($"<c r=\"{a1}\" t=\"s\"><v>{S(v)}</v></c>");
                 }
                 else
                 {
+                    // Coba tulis sebagai angka kalau bisa
                     if (double.TryParse(v.Replace(",","."), NumberStyles.Float, CultureInfo.InvariantCulture, out var num))
                         sheetSb.Append($"<c r=\"{a1}\"><v>{num.ToString(CultureInfo.InvariantCulture)}</v></c>");
                     else
@@ -469,7 +677,7 @@ public class MultithreadingManager : MonoBehaviour
             "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"" + sst.Count + "\" uniqueCount=\"" + sst.Count + "\">" +
             string.Join("", sst.Select(s => $"<si><t>{XmlEscape(s)}</t></si>")) + "</sst>";
 
-        // Other minimal parts
+        // Other minimal parts (paket XLSX wajib punya ini)
         string contentTypes =
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
             "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" +
@@ -547,6 +755,13 @@ public class MultithreadingManager : MonoBehaviour
     }
 
     // ===== Concurrency: worker pool of coroutines =====
+
+    /// <summary>
+    /// Jalankan worker pool untuk memproses semua baris di <see cref="_rows"/>.
+    /// - Bikin N worker (N = maxConcurrency, min 1)
+    /// - Masing-masing worker ambil index baris berikutnya secara atomik
+    /// - Update status tiap 50 baris atau saat selesai
+    /// </summary>
     IEnumerator ProcessAll()
     {
         statusText.text = $"Processing {_rows.Count} rows…";
@@ -560,21 +775,24 @@ public class MultithreadingManager : MonoBehaviour
         for (int i=0;i<N;i++)
             workers.Add(StartCoroutine(Worker()));
 
-        // wait all
+        // Tunggu semua worker selesai
         foreach (var w in workers) yield return w;
 
         var dur = Time.realtimeSinceStartup - startTime;
         statusText.text = $"Done: {completed}/{_rows.Count} rows in {dur:0.0}s";
 
+        // Worker lokal (closure) yang ambil task satu-per-satu
         IEnumerator Worker()
         {
             while (true)
             {
+                // Ambil index berikutnya secara thread-safe
                 int my = System.Threading.Interlocked.Increment(ref idx);
                 if (my >= _rows.Count) yield break;
 
                 var row = _rows[my];
-                yield return StartCoroutine(FillWeather(row)); // retries inside
+                // Ambil cuaca (punya mekanisme retry di dalamnya)
+                yield return StartCoroutine(FillWeather(row));
 
                 int c = System.Threading.Interlocked.Increment(ref completed);
                 if (c % 50 == 0 || c == _rows.Count)
@@ -583,6 +801,14 @@ public class MultithreadingManager : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// Ambil data cuaca untuk satu baris lokasi:
+    /// - Susun query "lat,lon"
+    /// - Pilih endpoint (relay atau WeatherAPI langsung)
+    /// - Kirim request (timeout 30s)
+    /// - Kalau error transient (429/5xx/timeout), lakukan retry dengan backoff + jitter
+    /// - Isi field output di row jika berhasil parse
+    /// </summary>
     IEnumerator FillWeather(KecamatanRow row)
     {
         string q = $"{row.Lat.ToString(CultureInfo.InvariantCulture)},{row.Lon.ToString(CultureInfo.InvariantCulture)}";
@@ -605,8 +831,10 @@ public class MultithreadingManager : MonoBehaviour
             }
             req.timeout = 30;
 
+            // Kirim request + tunggu selesai
             yield return req.SendWebRequest();
 
+            // Tanda error transient => eligible untuk retry
             bool transient =
                 req.result != UnityWebRequest.Result.Success ||
                 req.responseCode == 429 || // rate limit
@@ -620,6 +848,7 @@ public class MultithreadingManager : MonoBehaviour
                     var data = JsonUtility.FromJson<WeatherApiCurrentResponse>(json);
                     if (data?.current == null) throw new Exception("Missing current.");
 
+                    // Map field JSON ke row output
                     row.LastUpdate = data.current.last_updated ?? "";
                     row.SuhuC = data.current.temp_c;
                     row.Kelembapan = data.current.humidity;
@@ -632,25 +861,29 @@ public class MultithreadingManager : MonoBehaviour
                 }
                 catch (Exception ex)
                 {
+                    // Kalau JSON berubah/aneh: kita log & lanjut (row tetap ada tapi mungkin kosong)
                     if (verbose) Debug.LogWarning($"Parse error for {row.Name}: {ex.Message}");
                 }
-                yield break;
+                yield break; // selesai untuk row ini (berhasil atau minimal sudah dicoba parse)
             }
 
+            // Gagal & bukan kondisi yang bisa diatasi langsung → cek batas retry
             if (attempt >= maxRetries)
             {
                 if (verbose) Debug.LogWarning($"Giving up {row.Name} after {attempt} tries. HTTP {req.responseCode} {req.error}");
                 yield break;
             }
 
-            // backoff with jitter
+            // Backoff dengan jitter: makin sering gagal, makin lama nunggu (tapi dibatasi 10 detik)
             float delay = Mathf.Min(10f, 0.8f * attempt + UnityEngine.Random.Range(0f, 0.6f));
             yield return new WaitForSecondsRealtime(delay);
         }
     }
 
     // Minimal response types (subset of your Tenki types)
+    /// <summary>Substruktur kondisi cuaca.</summary>
     [Serializable] public class Condition { public string text; public string icon; public int code; }
+    /// <summary>Substruktur data "current" dari WeatherAPI.</summary>
     [Serializable] public class Current
     {
         public string last_updated;
@@ -662,11 +895,13 @@ public class MultithreadingManager : MonoBehaviour
         public double wind_degree;
         public string wind_dir;
     }
+    /// <summary>Struktur utama untuk deserialisasi JSON WeatherAPI (current.json).</summary>
     [Serializable] public class WeatherApiCurrentResponse
     {
         public Location location;
         public Current current;
     }
+    /// <summary>Info lokasi dari respons WeatherAPI (tidak semuanya dipakai).</summary>
     [Serializable] public class Location
     {
         public string name; public string region; public string country;
@@ -674,5 +909,3 @@ public class MultithreadingManager : MonoBehaviour
         public string localtime;
     }
 }
-
-
